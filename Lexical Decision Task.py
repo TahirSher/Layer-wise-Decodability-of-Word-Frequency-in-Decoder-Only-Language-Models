@@ -114,9 +114,9 @@ class ModelConfig:
 
 @dataclass
 class Config:
-    WORDS_PATH:    str = "/home/tahir/EMNLP-Conference/Items.csv"
-    NONWORDS_PATH: str = "/home/tahir/EMNLP-Conference/NonWord.csv"
-    OUTPUT_DIR:    str = "/home/tahir/EMNLP-Conference/19April-LDT_simple_results"
+    WORDS_PATH:    str = "Items.csv"
+    NONWORDS_PATH: str = "NonWord.csv"
+    OUTPUT_DIR:    str = "LDT_results"
 
     MODELS: List[ModelConfig] = field(default_factory=lambda: [
 
