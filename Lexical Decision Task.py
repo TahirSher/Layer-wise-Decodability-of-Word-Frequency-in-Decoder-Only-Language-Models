@@ -452,10 +452,6 @@ class AllLayerExtractor:
         )
 
         # ── dtype selection ───────────────────────────────────────────
-        # bfloat16 has the same exponent range as float32 (max ~3.4e38)
-        # so it eliminates the fp16 overflow→NaN problem in deep layers
-        # while using the same 2 bytes per parameter as fp16.
-        # Requires compute capability ≥ 8.0 (Ampere: A100, A6000, etc.)
         if device == 'cuda' and torch.cuda.is_available():
             cc = torch.cuda.get_device_capability(0)
             if cc[0] >= 8:
@@ -549,53 +545,6 @@ class AllLayerExtractor:
     def _pool(self, layer_hidden_b: torch.Tensor,
               attention_mask_b: torch.Tensor,
               strategy: str = "last_token") -> np.ndarray:
-        """
-        Pool a single sample's hidden states to a fixed-size vector.
-
-        Parameters
-        ----------
-        layer_hidden_b   : (T, H) — one sample's hidden states for one layer
-        attention_mask_b : (T,) — attention mask (1=real, 0=pad)
-        strategy         : 'last_token' or 'mean_pool'
-
-        Returns
-        -------
-        float32 numpy vector of shape (H,)
-
-        NaN handling
-        ────────────
-        Deep transformer layers in fp16 can overflow for certain inputs,
-        producing NaN/Inf in hidden states. We upcast to float32 BEFORE
-        pooling to rescue values that are merely large (> 65504) but
-        within fp32 range. For values that are already NaN from the
-        model's internal fp16 computation (e.g. Inf * 0 in LayerNorm),
-        we replace them with 0.0 post-pooling so they do not propagate
-        into downstream probe training (StandardScaler, gradient
-        computation, etc.). Affected samples are counted and logged
-        by _sanity_check.
-
-        Pooling logic
-        ─────────────
-        last_token:
-            Encoder-only: CLS token at position 0.
-            Decoder-only + left-pad: position -1 (always real).
-            Decoder-only + right-pad: last non-pad position.
-
-        mean_pool:
-            Mean of all non-padding token representations.
-            Muennighoff et al. (2022) show mean pooling can be
-            competitive with last-token pooling for representation
-            extraction. Masking out padding tokens is essential for
-            unbiased mean computation — padding tokens carry no
-            semantic information and would dilute the representation.
-        """
-        # ── Upcast to fp32 BEFORE any arithmetic ──────────────────────
-        # This is the primary defence against fp16 overflow NaNs.
-        # In fp16, values > 65504 become Inf, and Inf in LayerNorm
-        # produces NaN.  Upcasting here cannot recover values that
-        # the model already turned into NaN internally, but it
-        # prevents the pooling arithmetic itself from introducing
-        # additional precision loss.
         layer_hidden_b = layer_hidden_b.float()
         attention_mask_b = attention_mask_b.float()
 
@@ -618,15 +567,6 @@ class AllLayerExtractor:
                     vec = layer_hidden_b[max(actual_len - 1, 0), :]
 
         result = vec.cpu().numpy()
-
-        # ── Replace residual NaN/Inf with 0.0 ────────────────────────
-        # These are values the model itself produced as NaN in fp16
-        # (irrecoverable). Replacing with 0.0 is conservative: it
-        # prevents downstream StandardScaler from producing all-NaN
-        # columns and keeps the sample in the dataset (dropping it
-        # would change N and break stratification). The sanity check
-        # counts and logs these so the user knows which layers and
-        # how many samples are affected.
         nan_mask = ~np.isfinite(result)
         if nan_mask.any():
             result[nan_mask] = 0.0
@@ -637,14 +577,7 @@ class AllLayerExtractor:
     def extract_all_layers(self, dataloader,
                            pooling_strategy: str = "last_token"
                            ) -> Tuple[Dict[int, np.ndarray], Dict]:
-        """
-        Run ONE forward pass per batch, cache all layers.
 
-        Returns
-        ───────
-        all_hidden : dict  {layer_idx (0 … num_layers-1) : np.ndarray (N, H)}
-        targets    : dict  {metadata arrays for the full dataset}
-        """
         layer_accum: Dict[int, List[np.ndarray]] = {
             li: [] for li in range(self.num_layers)
         }
@@ -734,18 +667,7 @@ class AllLayerExtractor:
         return all_hidden, targets
 
     def _sanity_check(self, all_hidden: Dict[int, np.ndarray]):
-        """
-        Verify extracted representations are not degenerate.
 
-        Checks every layer (not just sampled ones) because NaN
-        issues are layer-specific — they typically appear only in
-        the deepest layers where the residual stream magnitude is
-        highest and most likely to overflow fp16.
-
-        Logs a clear FAIL/WARN/OK status per layer. Previously
-        this method could log 'sanity OK' even when NaN was present
-        because the OK message was gated only on the variance check.
-        """
         total_nan_samples = 0
         total_inf_samples = 0
         total_zero_samples = 0
@@ -771,8 +693,6 @@ class AllLayerExtractor:
             has_problem = (n_zero > 0 or n_nan > 0 or n_inf > 0
                            or (not np.isnan(var) and var < 1e-6))
 
-            # Only log details for first, middle, last, and problem layers
-            # to avoid flooding the log for 32+ layer models
             is_sampled = li in [0, self.num_layers // 2, self.num_layers - 1]
 
             if has_problem:
@@ -894,7 +814,6 @@ class LexicalDecisionClassifier(nn.Module):
         for l in self.layers: x = l(x)
         return self.out(x)
 
-
 class FocalLoss(nn.Module):
     """
     Lin et al. (2017). When gamma=0, reduces to weighted cross-entropy.
@@ -937,7 +856,7 @@ def _full_metrics(y_true, y_pred, y_prob, group_name) -> Dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# FREQUENCY ANALYZER  (probe training + evaluation, memory-only)
+# FREQUENCY ANALYZER  
 # ════════════════════════════════════════════════════════════════════════════
 
 class FrequencyAnalyzer:
@@ -1144,16 +1063,10 @@ class FrequencyAnalyzer:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# EXTENDED ANALYSES (Document Requirements 1–7)
+# EXTENDED ANALYSES
 # ════════════════════════════════════════════════════════════════════════════
 
 class ExtendedAnalyses:
-    """
-    Implements all seven analyses required to make the frequency claim
-    defensible. Each method operates on pre-extracted hidden states (numpy
-    arrays cached in CPU RAM) — no additional GPU forward passes needed.
-    """
-
     def __init__(self, config: Config):
         self.config = config
         self.device = config.DEVICE
@@ -1301,17 +1214,6 @@ class ExtendedAnalyses:
     # ────────────────────────────────────────────────────────────────────
     def tokenization_controlled_analysis(self, all_hidden, targets,
                                           model_name) -> Dict:
-        """
-        Control for tokenization confounds by:
-        1. Running the LDT probe on SINGLE-TOKEN stimuli only.
-        2. Running on token-count-matched high vs low subsets.
-
-        Rationale: High-frequency words tend to be single subword tokens
-        while low-frequency words are split into multiple subwords. For
-        last-token pooling, multi-token words have their representation
-        at a token that may not capture the full word meaning, creating
-        a systematic confound between tokenization and frequency.
-        """
         logger.info(f"  [Analysis 2] Tokenization-controlled — {model_name}")
 
         is_word        = targets['is_word']
@@ -1426,20 +1328,6 @@ class ExtendedAnalyses:
     # ────────────────────────────────────────────────────────────────────
     def confound_matched_analysis(self, all_hidden, targets,
                                    model_name) -> Dict:
-        """
-        Match high- and low-frequency words on character length,
-        orthographic neighborhood density (Ortho_N), and token count.
-        Then rerun the direct frequency probe on matched subsets.
-
-        Uses nearest-neighbor matching without replacement: for each
-        low-frequency word, find the high-frequency word closest in
-        the [length, ortho_n, token_count] feature space. This ensures
-        any probe accuracy differences cannot be attributed to these
-        lexical confounds.
-
-        Also produces a balance table showing group statistics before
-        and after matching for the paper's methods section.
-        """
         logger.info(f"  [Analysis 3] Confound-matched frequency — {model_name}")
 
         is_word      = targets['is_word']
@@ -1578,20 +1466,6 @@ class ExtendedAnalyses:
     # ────────────────────────────────────────────────────────────────────
     def multi_seed_stability(self, all_hidden, targets, model_name,
                               n_seeds: int = 5) -> Dict:
-        """
-        Repeat the main LDT probe pipeline across multiple random seeds,
-        using different train/val/test splits and weight initialisations.
-        Report mean ± std per layer.
-
-        This addresses the concern that results from a single 70/15/15
-        split may be unstable. Seeds control:
-          1. train_test_split random_state
-          2. PyTorch weight initialisation (torch.manual_seed)
-          3. WeightedRandomSampler ordering
-
-        The reported confidence interval width directly indicates whether
-        the frequency effect is robust to data sampling variance.
-        """
         logger.info(f"  [Analysis 4] Multi-seed stability ({n_seeds} seeds) "
                     f"— {model_name}")
 
@@ -1599,8 +1473,6 @@ class ExtendedAnalyses:
         seeds = [SEED + i * 7 for i in range(n_seeds)]  # Deterministic seed sequence
 
         # Collect per-seed, per-layer results
-        # We only probe a representative subset of layers to save time:
-        # first, middle, last, and every 4th layer
         all_layers = sorted(all_hidden.keys())
         probe_layers = sorted(set(
             [all_layers[0], all_layers[len(all_layers)//4],
@@ -1666,30 +1538,6 @@ class ExtendedAnalyses:
     # ────────────────────────────────────────────────────────────────────
     def probe_selectivity_controls(self, all_hidden, targets,
                                     model_name) -> Dict:
-        """
-        Three control conditions to establish probe selectivity
-        (Hewitt & Liang, 2019):
-
-        1. Linear probe baseline:
-           Replace the MLP probe with logistic regression.
-           If a linear probe also finds the effect, the information
-           is linearly accessible (stronger claim). If only the MLP
-           finds it, the information may be non-linearly encoded
-           (weaker claim about explicit representation).
-
-        2. Shuffled-label control:
-           Train the MLP probe with randomly permuted labels.
-           This establishes the ceiling for memorisation/overfitting.
-           If the shuffled probe achieves high accuracy, the probe
-           architecture has too much capacity relative to the dataset
-           and results are not trustworthy.
-
-        3. Selectivity (accuracy_task − accuracy_shuffled):
-           A positive selectivity score indicates the probe is
-           extracting genuine linguistic signal rather than just
-           memorising arbitrary patterns. Hewitt & Liang recommend
-           selectivity > 0 with a comfortable margin.
-        """
         logger.info(f"  [Analysis 6] Probe selectivity controls — {model_name}")
 
         is_word = targets['is_word']
@@ -1817,22 +1665,6 @@ class ExtendedAnalyses:
     # ────────────────────────────────────────────────────────────────────
     def continuous_frequency_regression(self, all_hidden, targets,
                                          model_name) -> Dict:
-        """
-        Predict continuous log_HAL frequency from hidden states using
-        ridge regression. This provides stronger psycholinguistic evidence
-        than tertile separation because it treats frequency as a continuous
-        variable and avoids information loss from discretisation.
-
-        R² and Spearman correlation are reported per layer.
-        A positive R² means the hidden states carry frequency information
-        beyond what a constant (mean) prediction would give.
-
-        Ridge regression (L2 penalty) is chosen over OLS because
-        hidden-state dimensionality (e.g. 2048) may exceed training
-        samples, and L2 regularisation prevents degenerate coefficient
-        inflation. Alpha is selected from {0.1, 1, 10, 100} by
-        validation-set R².
-        """
         logger.info(f"  [Analysis 7] Continuous frequency regression — {model_name}")
 
         is_word      = targets['is_word']
@@ -2893,38 +2725,17 @@ class MultiModelExperiment:
             index=False)
 
         meta = {
-            'version': 'Extended analyses for defensible frequency claims',
+            'version': 'Extended analyses',
             'experiment_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'models': [{'name': m.name, 'model_id': m.model_id,
                         'architecture': m.architecture_type.value,
                         'input_mode': m.input_mode.value,
                         'padding_side': m.padding_side.value}
                        for m in self.config.MODELS],
-            'extended_analyses': [
-                '1. Direct frequency probe (binary H-vs-L + 3-way H/M/L)',
-                '2. Tokenization-controlled rerun (single-token + token-matched)',
-                '3. Lexical-confound-matched rerun (length + Ortho_N + token-count matching)',
-                '4. Multi-seed stability (N seeds with mean ± std)',
-                '5. Pooling ablation (last-token vs mean-pool)',
-                '6. Probe selectivity controls (linear baseline + shuffled labels)',
-                '7. Continuous frequency regression (Ridge on log_HAL)',
-            ],
-            'references': [
-                'He et al. (2015): Kaiming init for ReLU',
-                'He et al. (2016): Pre-activation residual blocks',
-                'Lin et al. (2017): Focal Loss',
-                'Ioffe & Szegedy (2015): Batch Normalisation',
-                'Agresti (2002): Two-proportion z-test',
-                'Muennighoff et al. (2022): SGPT — last-token pooling',
-                'Hewitt & Liang (2019): Designing and interpreting probes',
-                'Yang et al. (2024): Qwen2 Technical Report',
-                'Falcon-LLM Team (2024): Falcon 3 Family of Open Models',
-                'Meta AI (2024): Llama 3.2 — Llama 3.2-3B base model',
-            ],
         }
         with open(os.path.join(self.config.COMPARISON_DIR, 'metadata.json'), 'w') as f:
             json.dump(meta, f, indent=2)
-        logger.info("✓ Saved all cross-model CSVs and metadata.json")
+        logger.info(" Saved all cross-model CSVs and metadata.json")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2936,12 +2747,11 @@ def main():
     print(f"\n{'='*64}\nVERIFYING DATA FILES\n{'='*64}")
     for path, name in [(config.WORDS_PATH,'Words'),(config.NONWORDS_PATH,'NonWords')]:
         if os.path.exists(path):
-            print(f"  ✓  {name}  →  {path}")
+            print(f"    {name}  →  {path}")
         else:
-            print(f"  ✗  MISSING: {name}  →  {path}"); return None
+            print(f"    MISSING: {name}  →  {path}"); return None
     print()
     return MultiModelExperiment(config).run()
-
 
 if __name__ == "__main__":
     main()
